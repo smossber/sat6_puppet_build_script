@@ -1,0 +1,1 @@
+# sat6_puppet_build_script
