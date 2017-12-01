@@ -1,0 +1,117 @@
+#!/bin/bash
+#
+# Author: Sebastian Mossberg <smossber@redhat.com>
+# 2017-12-01
+#
+# This script builds the puppet module
+# Uploads it to Satellite to the product MIGV
+# into the repository: migv-puppet-modules-dev
+#
+# It will then add the module to the CV-PUPPET-DEV
+# and publish a new version.
+# The new version will be promoted to the Puppet-Dev environment
+#
+# Hosts using this Puppet KT_Environment should get the new module available
+#
+# This allows for faster development iterations with the Satellite as an ENC.
+#
+# # hammer
+# The script requires that hammer cli utility is installed.
+# You can fetch hammer from here: https://github.com/theforeman/hammer-cli/blob/master/doc/installation_rpm.md#installation-from-rpms
+# Hammer needs the credentials in /etc/hammer/cli_config.yml
+# so that we don't need to authenticate each time
+#
+# # jq
+# We also need the jq utility to parse the JSON metadata file
+# you can download the binary from from here: https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64
+# chmod +x the file and place it in your path eg. /usr/local/bin/
+
+
+
+if [ ! $1 ]; then
+        echo "Need to specify path to the module your trying to build"
+        echo "./build_script.sh /path/to/module/"
+        exit 1
+fi
+
+MODULE_PATH=$(puppet module build $1 | grep "Module built" | cut -d":" -f2)
+if [ $? != 0 ]; then
+        echo "build failed"
+        exit 1
+fi
+echo $MODULE_PATH
+
+metadata=$(cat $1/metadata.json)
+echo $metadata
+MODULE_NAME=$(echo $metadata | jq ".name" | sed 's/"//g')
+MODULE_SAT_NAME=$(echo $MODULE_NAME | cut -d"-" -f2 )
+MODULE_AUTHOR=$(echo $metadata | jq ".author" | sed 's/"//g')
+MODULE_VERSION=$(echo $metadata | jq ".version" | sed 's/"//g')
+
+echo "MODULE_NAME: ${MODULE_NAME}"
+echo "MODULE_SAT_NAME: ${MODULE_SAT_NAME}"
+echo "MODULE_AUTHOR: ${MODULE_AUTHOR}"
+echo "MODULE_VERSION: ${MODULE_VERSION}"
+echo ""
+
+version_output=$(hammer puppet-module list --product MIGV --repository migv-puppet-modules-dev --organization-id 1 | grep hardening | grep migv | awk '{ print $7 }')
+echo "Existing versions:  "
+echo "$version_output"
+if [[ $version_output == *${MODULE_VERSION}* ]]; then
+        echo ""
+        echo "The version you're trying to upload is already in use.."
+        echo "Bump the version in your metadata.json and rerun the script"
+        exit 1
+        #hammer content-view puppet-module remove --content-view CV-PUPPET-DEV --author ${MODULE_AUTHOR} --name ${MODULE_SAT_NAME} --organization-id 1 > /dev/null 2>&1
+fi
+
+
+hammer repository upload-content --id 1640 --product-id 45 --path ${MODULE_PATH} --organization-id 1
+if [ $? != 0 ]; then
+        echo "Upload failed.."
+        exit 1
+fi
+sleep 5
+
+echo "hammer content-view puppet-module add --content-view CV-PUPPET-DEV --author ${MODULE_AUTHOR} --name ${MODULE_SAT_NAME} --organization-id 1"
+
+hammer content-view puppet-module add --content-view CV-PUPPET-DEV --author ${MODULE_AUTHOR} --name ${MODULE_SAT_NAME} --organization-id 1 > /dev/null 2>&1
+if [ $? == 65 ]; then
+        echo "Module already placed in CV-PUPPET-DEV, new version should now be in use"
+fi
+
+sleep 3
+
+echo ""
+echo "Start pulbishing new version of CV-PUPPET-DEV.."
+
+output=$(hammer content-view publish --name CV-PUPPET-DEV --organization-id 1 --description "adding ${MODULE_NAME} v.${MODULE_VERSION}")
+publish_exit_code=$?
+if [ $publish_exit_code != 0 ]; then
+        echo "Couldn't publish the CV"
+        echo "Check tasks and production.log for clues..."
+        exit 0
+fi
+
+sleep 4
+
+echo ""
+echo "Promote the new version to Puppet DEV environment.."
+echo ""
+hammer  content-view version promote --content-view CV-PUPPET-DEV --from-lifecycle-environment Library --to-lifecycle-environment Puppet-Dev --organization-id 1
+if [ $? != 0 ]; then
+        echo "Couldn't promote latest version to Puppet-Dev"
+        echo "Is some other content-view task running?"
+        echo ""
+        echo "Perform the promotion step manually.."
+        exit 1
+fi
+echo ""
+echo "Puppet module ${MODULE_NAME} successfully uploaded, published and promoted."
+echo ""
+echo "Hosts using the environment KT_Organization_Puppet_Dev_CV_PUPPET_DEV_56 should now have the latest version of the module applicable"
+echo ""
+echo "When satisfied with your testing, upload the same tar file (${MODULE_PATH})"
+echo "to Product -> MIGV -> Repo(migv-puppet-modules)"
+echo "and publish a new version of CV-PUPPET, and promote that to the regular lifecycle environments"
+exit 0
